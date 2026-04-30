@@ -167,6 +167,35 @@ def do_connect_request(sock, stream_id, authority, reset_after_headers):
     raise TimeoutError(f"stream {stream_id} did not receive a response")
 
 
+def do_get_request(sock, stream_id, authority):
+    block = b"".join(
+        [
+            b"\x82",  # :method: GET
+            b"\x84",  # :path: /
+            b"\x87",  # :scheme: https
+            literal_indexed_name(1, authority),
+        ]
+    )
+    sock.sendall(frame(0x1, 0x5, stream_id, block))
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        item = read_frame(sock)
+        if item is None:
+            raise RuntimeError("connection closed while waiting for response")
+
+        frame_type, flags, sid, _ = item
+
+        if frame_type == 0x4 and not (flags & 0x1):
+            sock.sendall(frame(0x4, 0x1, 0))
+            continue
+
+        if sid == stream_id and (flags & 0x1):
+            return
+
+    raise TimeoutError(f"stream {stream_id} did not finish")
+
+
 def wait_port(port, timeout=5):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -231,6 +260,10 @@ def write_conf(workdir, listen_port, backend_port, scenario):
                 http2 on;
                 resolver 1.1.1.1 8.8.8.8;
 
+                location / {{
+                    return 204;
+                }}
+
                 tunnel_pass;
                 tunnel_auth_username user;
                 tunnel_auth_password pass;
@@ -281,19 +314,26 @@ def reset_backend(port, stop):
         listener.close()
 
 
-def run_round(host, port, authority, requests, reset_after_headers,
+def run_round(host, port, authority, requests, scenario, reset_after_headers,
               sock=None, first_stream_id=1):
     if sock is not None:
         stream_id = first_stream_id
         for _ in range(requests):
-            do_connect_request(sock, stream_id, authority, reset_after_headers)
+            if scenario == "plain-h2":
+                do_get_request(sock, stream_id, authority)
+            else:
+                do_connect_request(sock, stream_id, authority,
+                                   reset_after_headers)
             stream_id += 2
         return stream_id
 
     for _ in range(requests):
         sock = h2_connect(host, port)
         try:
-            do_connect_request(sock, 1, authority, reset_after_headers)
+            if scenario == "plain-h2":
+                do_get_request(sock, 1, authority)
+            else:
+                do_connect_request(sock, 1, authority, reset_after_headers)
         finally:
             sock.close()
 
@@ -311,7 +351,13 @@ def main():
     parser.add_argument("--backend-port", type=int, default=18080)
     parser.add_argument(
         "--scenario",
-        choices=["success", "acl-deny", "upstream-reset", "connect-timeout"],
+        choices=[
+            "success",
+            "acl-deny",
+            "upstream-reset",
+            "connect-timeout",
+            "plain-h2",
+        ],
         default="success",
     )
     parser.add_argument(
@@ -373,6 +419,8 @@ def main():
 
         if args.scenario == "connect-timeout":
             authority = f"10.255.255.1:{args.backend_port}"
+        elif args.scenario == "plain-h2":
+            authority = f"127.0.0.1:{args.listen_port}"
         else:
             authority = f"127.0.0.1:{args.backend_port}"
         baseline = rss_kb(nginx.pid)
@@ -401,6 +449,7 @@ def main():
                     args.listen_port,
                     authority,
                     args.requests,
+                    args.scenario,
                     args.reset_after_headers,
                     client_sock,
                     next_stream_id,

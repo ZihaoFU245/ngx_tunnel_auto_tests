@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 
 
@@ -212,6 +213,7 @@ def write_conf(workdir, listen_port, backend_port, scenario):
 
         http {{
             access_log off;
+            keepalive_requests 100000;
             client_body_temp_path {workdir}/client_body;
             proxy_temp_path {workdir}/proxy;
             fastcgi_temp_path {workdir}/fastcgi;
@@ -234,7 +236,7 @@ def write_conf(workdir, listen_port, backend_port, scenario):
                 tunnel_auth_password pass;
                 {acl_directive}
                 tunnel_buffer_size 16k;
-                tunnel_connect_timeout 60s;
+                tunnel_connect_timeout 500ms;
                 tunnel_idle_timeout 2s;
                 tunnel_probe_resistance off;
             }}
@@ -254,17 +256,39 @@ def start_process(args, **kwargs):
     return proc
 
 
-def run_round(host, port, authority, requests, reuse_connection, reset_after_headers):
-    if reuse_connection:
-        sock = h2_connect(host, port)
-        try:
-            for i in range(requests):
-                do_connect_request(
-                    sock, 1 + i * 2, authority, reset_after_headers
-                )
-        finally:
-            sock.close()
-        return
+def reset_backend(port, stop):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(128)
+    listener.settimeout(0.2)
+
+    try:
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+
+            try:
+                linger = struct.pack("ii", 1, 0)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+            finally:
+                conn.close()
+    finally:
+        listener.close()
+
+
+def run_round(host, port, authority, requests, reset_after_headers,
+              sock=None, first_stream_id=1):
+    if sock is not None:
+        stream_id = first_stream_id
+        for _ in range(requests):
+            do_connect_request(sock, stream_id, authority, reset_after_headers)
+            stream_id += 2
+        return stream_id
 
     for _ in range(requests):
         sock = h2_connect(host, port)
@@ -272,6 +296,8 @@ def run_round(host, port, authority, requests, reuse_connection, reset_after_hea
             do_connect_request(sock, 1, authority, reset_after_headers)
         finally:
             sock.close()
+
+    return first_stream_id
 
 
 def main():
@@ -284,12 +310,14 @@ def main():
     parser.add_argument("--listen-port", type=int, default=3128)
     parser.add_argument("--backend-port", type=int, default=18080)
     parser.add_argument(
-        "--scenario", choices=["success", "acl-deny"], default="success"
+        "--scenario",
+        choices=["success", "acl-deny", "upstream-reset", "connect-timeout"],
+        default="success",
     )
     parser.add_argument(
         "--reuse-connection",
         action="store_true",
-        help="send all CONNECT streams in a round on one HTTP/2 connection",
+        help="send all CONNECT streams across all rounds on one HTTP/2 connection",
     )
     parser.add_argument(
         "--reset-after-headers",
@@ -306,22 +334,34 @@ def main():
 
     backend_log = open(os.path.join(workdir, "backend.log"), "wb")
     nginx_log = open(os.path.join(workdir, "nginx.stdout"), "wb")
+    reset_stop = threading.Event()
+    reset_thread = None
 
     try:
-        backend = start_process(
-            [
-                sys.executable,
-                "-m",
-                "http.server",
-                str(args.backend_port),
-                "--bind",
-                "127.0.0.1",
-            ],
-            cwd=workdir,
-            stdout=backend_log,
-            stderr=subprocess.STDOUT,
-        )
-        wait_port(args.backend_port)
+        if args.scenario in ("success", "acl-deny"):
+            start_process(
+                [
+                    sys.executable,
+                    "-m",
+                    "http.server",
+                    str(args.backend_port),
+                    "--bind",
+                    "127.0.0.1",
+                ],
+                cwd=workdir,
+                stdout=backend_log,
+                stderr=subprocess.STDOUT,
+            )
+            wait_port(args.backend_port)
+
+        elif args.scenario == "upstream-reset":
+            reset_thread = threading.Thread(
+                target=reset_backend,
+                args=(args.backend_port, reset_stop),
+                daemon=True,
+            )
+            reset_thread.start()
+            wait_port(args.backend_port)
 
         nginx = start_process(
             [args.nginx, "-c", conf, "-p", workdir, "-e", os.path.join(workdir, "error.log")],
@@ -331,9 +371,14 @@ def main():
         )
         wait_port(args.listen_port)
 
-        authority = f"127.0.0.1:{args.backend_port}"
+        if args.scenario == "connect-timeout":
+            authority = f"10.255.255.1:{args.backend_port}"
+        else:
+            authority = f"127.0.0.1:{args.backend_port}"
         baseline = rss_kb(nginx.pid)
         previous = baseline
+        client_sock = None
+        next_stream_id = 1
 
         print(f"scenario={args.scenario}")
         print(f"nginx_pid={nginx.pid}")
@@ -345,26 +390,34 @@ def main():
         print("round rss_before_kb rss_after_kb delta_round_kb delta_total_kb")
 
         increases = []
-        for round_no in range(1, args.rounds + 1):
-            before = rss_kb(nginx.pid)
-            run_round(
-                "127.0.0.1",
-                args.listen_port,
-                authority,
-                args.requests,
-                args.reuse_connection,
-                args.reset_after_headers,
-            )
-            time.sleep(1)
-            after = rss_kb(nginx.pid)
-            delta_round = after - before
-            delta_total = after - baseline
-            increases.append(after - previous)
-            previous = after
-            print(
-                f"{round_no} {before} {after} {delta_round} {delta_total}",
-                flush=True,
-            )
+        try:
+            if args.reuse_connection:
+                client_sock = h2_connect("127.0.0.1", args.listen_port)
+
+            for round_no in range(1, args.rounds + 1):
+                before = rss_kb(nginx.pid)
+                next_stream_id = run_round(
+                    "127.0.0.1",
+                    args.listen_port,
+                    authority,
+                    args.requests,
+                    args.reset_after_headers,
+                    client_sock,
+                    next_stream_id,
+                )
+                time.sleep(1)
+                after = rss_kb(nginx.pid)
+                delta_round = after - before
+                delta_total = after - baseline
+                increases.append(after - previous)
+                previous = after
+                print(
+                    f"{round_no} {before} {after} {delta_round} {delta_total}",
+                    flush=True,
+                )
+        finally:
+            if client_sock is not None:
+                client_sock.close()
 
         if all(delta > 0 for delta in increases[1:]):
             print("result=possible_leak repeated RSS increase after warmup")
@@ -374,6 +427,9 @@ def main():
         return 0
 
     finally:
+        reset_stop.set()
+        if reset_thread is not None:
+            reset_thread.join(timeout=1)
         backend_log.close()
         nginx_log.close()
         cleanup()

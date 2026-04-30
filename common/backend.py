@@ -40,6 +40,13 @@ def start_echo_backend(port: int) -> threading.Thread:
     return thread
 
 
+def start_stream_echo_backend(port: int) -> threading.Thread:
+    thread = threading.Thread(target=stream_echo_backend, args=(port,), daemon=True)
+    thread.start()
+    wait_tcp_port(port)
+    return thread
+
+
 def echo_backend(port: int) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -57,6 +64,29 @@ def echo_connection(conn: socket.socket) -> None:
     if data:
         conn.sendall(data)
     conn.close()
+
+
+def stream_echo_backend(port: int) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(512)
+    while True:
+        readable, _, _ = select.select([listener], [], [], 0.2)
+        if readable:
+            conn, _ = listener.accept()
+            threading.Thread(target=stream_echo_connection, args=(conn,), daemon=True).start()
+
+
+def stream_echo_connection(conn: socket.socket) -> None:
+    try:
+        while True:
+            data = conn.recv(65535)
+            if not data:
+                break
+            conn.sendall(data)
+    finally:
+        conn.close()
 
 
 def reset_backend(port: int, stop: threading.Event) -> None:

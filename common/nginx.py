@@ -100,6 +100,7 @@ class NginxTestServer:
             http {{
                 access_log off;
                 keepalive_requests 100000;
+                client_max_body_size 0;
                 client_body_temp_path {self.workdir}/client_body;
                 proxy_temp_path {self.workdir}/proxy;
                 fastcgi_temp_path {self.workdir}/fastcgi;

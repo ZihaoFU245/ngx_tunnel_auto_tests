@@ -5,14 +5,15 @@ import argparse
 import asyncio
 
 from common import h2
-from common.backend import start_http_backend
+from common.backend import start_echo_backend
 from common.nginx import NginxConfig, NginxTestServer
 from common.paths import DEFAULT_NGINX
 
 
 async def run(args) -> None:
-    with NginxTestServer(args.nginx, NginxConfig(args.listen_port, args.backend_port)) as server:
-        start_http_backend(server.processes, server.workdir, args.backend_port)
+    config = NginxConfig(args.listen_port, args.backend_port, root_response=False)
+    start_echo_backend(args.backend_port)
+    with NginxTestServer(args.nginx, config) as server:
         await h2.run_connects(
             "127.0.0.1",
             args.listen_port,

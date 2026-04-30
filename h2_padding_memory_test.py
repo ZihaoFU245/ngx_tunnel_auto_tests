@@ -11,7 +11,7 @@ from common.paths import DEFAULT_NGINX
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run HTTP/2 CONNECT memory regression test.")
+    parser = argparse.ArgumentParser(description="Run HTTP/2 padding memory regression test.")
     parser.add_argument("--nginx", default=str(DEFAULT_NGINX))
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--requests", type=int, default=1000)
@@ -20,14 +20,14 @@ def main() -> int:
     parser.add_argument("--backend-port", type=int, default=18080)
     args = parser.parse_args()
 
-    config = NginxConfig(args.listen_port, args.backend_port, root_response=False)
     start_echo_backend(args.backend_port)
+    config = NginxConfig(args.listen_port, args.backend_port, padding=True, root_response=False)
     with NginxTestServer(args.nginx, config) as server:
         return run_async_memory_rounds(
             pid=server.pid,
             rounds=args.rounds,
             requests=args.requests,
-            runner=lambda count: h2.run_connects(
+            runner=lambda count: h2.run_padding_connects(
                 "127.0.0.1",
                 args.listen_port,
                 f"127.0.0.1:{args.backend_port}",

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .backend import wait_tcp_port
+from .certs import ensure_certificate
 from .paths import CERT, KEY, DEFAULT_NGINX
 from .process import ProcessSet
 
@@ -19,6 +20,8 @@ class NginxConfig:
     h3: bool = False
     acl_deny: bool = False
     connect_timeout: bool = False
+    padding: bool = False
+    root_response: bool = True
 
 
 class NginxTestServer:
@@ -30,6 +33,7 @@ class NginxTestServer:
         self.proc: subprocess.Popen[bytes] | None = None
 
     def __enter__(self) -> "NginxTestServer":
+        ensure_certificate()
         for name in ["client_body", "proxy", "fastcgi", "uwsgi", "scgi"]:
             (self.workdir / name).mkdir(parents=True, exist_ok=True)
         conf = self.write_conf()
@@ -69,6 +73,18 @@ class NginxTestServer:
             else ""
         )
         resolver = "resolver 1.1.1.1 8.8.8.8;"
+        padding_directive = "tunnel_padding on;" if self.config.padding else "tunnel_padding off;"
+        location = (
+            textwrap.dedent(
+                """
+                location / {
+                    return 204;
+                }
+                """
+            )
+            if self.config.root_response
+            else ""
+        )
         conf = textwrap.dedent(
             f"""
             daemon off;
@@ -102,9 +118,7 @@ class NginxTestServer:
                     http2 on;
                     {resolver}
 
-                    location / {{
-                        return 204;
-                    }}
+                    {location}
 
                     tunnel_pass;
                     tunnel_auth_username user;
@@ -114,6 +128,7 @@ class NginxTestServer:
                     tunnel_connect_timeout 500ms;
                     tunnel_idle_timeout 2s;
                     tunnel_probe_resistance off;
+                    {padding_directive}
                 }}
             }}
             """

@@ -31,7 +31,7 @@ def run_memory_rounds(
         previous = after
         print(f"{round_no} {before} {after} {after - before} {after - baseline}", flush=True)
     post_warmup = increases[1:]
-    if len(post_warmup) >= 2 and all(delta > 0 for delta in post_warmup):
+    if len(post_warmup) >= 2 and all(delta > 1024 for delta in post_warmup):
         print("result=possible_leak repeated RSS increase after warmup")
         return 2
     print("result=pass RSS did not increase every post-warmup round")

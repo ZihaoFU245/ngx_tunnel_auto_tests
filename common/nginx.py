@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .backend import wait_tcp_port
 from .certs import ensure_certificate
-from .paths import CERT, KEY, DEFAULT_NGINX
+from .paths import CERT, KEY, DEFAULT_NGINX, TUNNEL_MODULE
 from .process import ProcessSet
 
 
@@ -19,9 +19,13 @@ class NginxConfig:
     backend_port: int
     h3: bool = False
     acl_deny: bool = False
+    satisfy_any_allow_all: bool = False
     connect_timeout: bool = False
     padding: bool = False
     root_response: bool = True
+    probe_resistance: bool = False
+    auth_failure_code: int | None = None
+    auth_user_file_line: str = "user:$apr1$tunnelsa$H1PAZkbgAv289lfmsboYd."
 
 
 class NginxTestServer:
@@ -54,6 +58,12 @@ class NginxTestServer:
         return self.proc.pid
 
     def write_conf(self) -> Path:
+        user_file = self.workdir / "htpasswd"
+        user_file.write_text(
+            f"{self.config.auth_user_file_line}\n",
+            encoding="ascii",
+        )
+
         acl = ""
         if self.config.acl_deny:
             acl = textwrap.dedent(
@@ -65,6 +75,17 @@ class NginxTestServer:
             )
 
         acl_directive = "tunnel_acl_deny denied;" if self.config.acl_deny else ""
+        satisfy_directive = (
+            "satisfy any;\n"
+            "                    allow all;"
+            if self.config.satisfy_any_allow_all
+            else ""
+        )
+        load_module = (
+            f"load_module {TUNNEL_MODULE};"
+            if TUNNEL_MODULE.exists()
+            else ""
+        )
         quic_listen = (
             f"listen 127.0.0.1:{self.config.listen_port} quic reuseport;\n"
             "                http3 on;\n"
@@ -74,6 +95,16 @@ class NginxTestServer:
         )
         resolver = "resolver 1.1.1.1 8.8.8.8;"
         padding_directive = "tunnel_padding on;" if self.config.padding else "tunnel_padding off;"
+        probe_resistance_directive = (
+            "tunnel_probe_resistance on;"
+            if self.config.probe_resistance
+            else "tunnel_probe_resistance off;"
+        )
+        auth_failure_code_directive = (
+            f"tunnel_auth_failure_code {self.config.auth_failure_code};"
+            if self.config.auth_failure_code is not None
+            else ""
+        )
         location = (
             textwrap.dedent(
                 """
@@ -89,6 +120,7 @@ class NginxTestServer:
             f"""
             daemon off;
             master_process off;
+            {load_module}
             worker_processes 1;
             pid {self.workdir}/nginx.pid;
             error_log stderr notice;
@@ -122,13 +154,14 @@ class NginxTestServer:
                     {location}
 
                     tunnel_pass;
-                    tunnel_auth_username user;
-                    tunnel_auth_password pass;
+                    tunnel_proxy_auth_user_file {user_file};
+                    {satisfy_directive}
+                    {auth_failure_code_directive}
                     {acl_directive}
                     tunnel_buffer_size 16k;
                     tunnel_connect_timeout 500ms;
                     tunnel_idle_timeout 2s;
-                    tunnel_probe_resistance off;
+                    {probe_resistance_directive}
                     {padding_directive}
                 }}
             }}

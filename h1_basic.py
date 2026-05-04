@@ -6,7 +6,55 @@ import argparse
 from common import h1
 from common.backend import start_http_backend
 from common.nginx import NginxConfig, NginxTestServer
-from common.paths import DEFAULT_NGINX
+from common.paths import AUTH, DEFAULT_NGINX
+
+
+def connect_response(port: int, backend_port: int) -> bytes:
+    authority = f"127.0.0.1:{backend_port}"
+    payload = (
+        f"CONNECT {authority} HTTP/1.1\r\n"
+        f"Host: {authority}\r\n"
+        f"Proxy-Authorization: {AUTH}\r\n"
+        "\r\n"
+    ).encode("ascii")
+    return h1.request("127.0.0.1", port, payload)
+
+
+def status(response: bytes) -> int:
+    return int(response.split(b" ", 2)[1])
+
+
+def check_acl_deny_closes(args: argparse.Namespace) -> None:
+    config = NginxConfig(args.listen_port, args.backend_port, acl_deny=True,
+                         root_response=False)
+
+    with NginxTestServer(args.nginx, config) as server:
+        start_http_backend(server.processes, server.workdir, args.backend_port)
+
+        response = connect_response(args.listen_port, args.backend_port)
+        if status(response) != 403:
+            raise RuntimeError(f"ACL-denied CONNECT returned {response!r}")
+        if b"connection: keep-alive" in response.lower():
+            raise RuntimeError(f"ACL-denied CONNECT kept alive: {response!r}")
+
+
+def check_acl_deny_not_bypassed_by_satisfy_any(args: argparse.Namespace) -> None:
+    config = NginxConfig(
+        args.listen_port,
+        args.backend_port,
+        acl_deny=True,
+        satisfy_any_allow_all=True,
+        root_response=False,
+    )
+
+    with NginxTestServer(args.nginx, config) as server:
+        start_http_backend(server.processes, server.workdir, args.backend_port)
+
+        response = connect_response(args.listen_port, args.backend_port)
+        if status(response) != 403:
+            raise RuntimeError(
+                f"ACL-denied CONNECT was bypassed by satisfy any: {response!r}"
+            )
 
 
 def main() -> int:
@@ -25,6 +73,9 @@ def main() -> int:
         if connect_status < 200 or connect_status >= 300:
             raise RuntimeError(f"h1 CONNECT returned {connect_status}")
         print("h1_basic=pass")
+
+    check_acl_deny_closes(args)
+    check_acl_deny_not_bypassed_by_satisfy_any(args)
     return 0
 
 
